@@ -1,0 +1,11 @@
+# Python environment and cache
+.venv/
+venv/
+__pycache__/
+
+# Environment variables and secrets
+.env
+.streamlit/secrets.toml
+
+# Data files (optional, if you don't want to upload your data)
+*.csv
