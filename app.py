@@ -5,13 +5,14 @@ from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import requests
+import json
+import time
 
 # Load environment variables from the .env file
 load_dotenv()
 
 # --- Functions from your existing main.py file ---
 
-# A function to load and merge data (not needed for the deployed app, but good to have)
 @st.cache_data
 def load_data(symptoms_file, precautions_file):
     """
@@ -41,25 +42,34 @@ def load_data(symptoms_file, precautions_file):
     
     return documents
 
-# A function to initialize Pinecone and the embedding model
 @st.cache_resource
 def setup_pinecone_and_model():
     """
     Initializes the Pinecone client and a Sentence Transformer model.
     """
-    api_key = os.getenv("PINECONE_API_KEY")
+    # API key is now retrieved from Streamlit secrets
+    api_key = st.secrets.get("PINECONE_API_KEY")
+    if not api_key:
+        st.error("Pinecone API Key not found in Streamlit secrets. Please add it.")
+        return None, None, None
+
     pc = Pinecone(api_key=api_key)
     index_name = "medical-rag"
     model_name = 'all-MiniLM-L6-v2'
     model = SentenceTransformer(model_name)
     return pc, index_name, model
 
-# A function to perform the RAG query with Ollama
-def rag_query_with_ollama(pc, index_name, model, query_text):
+# Step 4: Perform RAG Query using the Gemini API
+def rag_query_with_gemini(pc, index_name, model, query_text):
     """
     Performs a vector search on Pinecone and uses the retrieved context
-    to generate an anwser with a local Ollama model (TinyLlama).
+    to generate an answer with the Gemini API.
     """
+    # Gemini API key is also retrieved from Streamlit secrets
+    gemini_api_key = st.secrets.get("GEMINI_API_KEY")
+    if not gemini_api_key:
+        return "Gemini API Key not found in Streamlit secrets. Please add it."
+
     index = pc.Index(index_name)
     query_embedding = model.encode(query_text).tolist()
     
@@ -70,19 +80,40 @@ def rag_query_with_ollama(pc, index_name, model, query_text):
         metadata = match['metadata']
         context += f"Disease: {metadata['disease']}. Symptoms: {metadata['symptoms']}. Precautions: {metadata['precautions']}\n"
     
+    # Construct a detailed prompt with the retrieved context
     prompt = f"Using the following medical context, answer the user's question. Specifically, provide the name of the possible disease and a medication or a precaution for it. If the context doesn't contain a direct answer, state that you cannot provide medical advice and suggest consulting a doctor.\n\nContext: {context}\n\nQuestion: {query_text}\n\nAnswer:"
     
-    try:
-        response = requests.post("http://localhost:11434/api/generate", json={
-            "model": "tinyllama",
-            "prompt": prompt,
-            "stream": False
-        })
-        response.raise_for_status()
-        return response.json()['response']
-        
-    except requests.exceptions.RequestException as e:
-        return f"Error communicating with Ollama: {e}. Please ensure Ollama is running and you have pulled the 'tinyllama' model."
+    # API call to Gemini
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={gemini_api_key}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ]
+    }
+    
+    response = None
+    retries = 0
+    max_retries = 5
+    while retries < max_retries:
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload))
+            response.raise_for_status()
+            result = response.json()
+            if result.get("candidates"):
+                return result["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                return "Could not generate a response. The API might have returned an empty result."
+        except requests.exceptions.RequestException as e:
+            st.error(f"Error communicating with Gemini API: {e}")
+            retries += 1
+            if retries < max_retries:
+                time.sleep(2 ** retries)  # Exponential backoff
+        except (KeyError, IndexError) as e:
+            st.error(f"Unexpected API response format: {e}")
+            return "Unexpected API response format."
+    return "Failed to get a response from the Gemini API after multiple retries."
+
 
 # --- Streamlit UI Code ---
 def main():
@@ -93,18 +124,19 @@ def main():
     # Initialize Pinecone and model
     pc, index_name, model = setup_pinecone_and_model()
 
-    # User input
-    user_query = st.text_input("Enter your symptoms or a medical question:", key="query_input")
-    
-    # Process query on button click
-    if st.button("Get Answer"):
-        if user_query:
-            with st.spinner("Searching for a diagnosis..."):
-                response = rag_query_with_ollama(pc, index_name, model, user_query)
-                st.success("Answer generated!")
-                st.write(response)
-        else:
-            st.warning("Please enter a query.")
+    if pc and index_name and model:
+        # User input
+        user_query = st.text_input("Enter your symptoms or a medical question:", key="query_input")
+        
+        # Process query on button click
+        if st.button("Get Answer"):
+            if user_query:
+                with st.spinner("Searching for a diagnosis..."):
+                    response = rag_query_with_gemini(pc, index_name, model, user_query)
+                    st.success("Answer generated!")
+                    st.write(response)
+            else:
+                st.warning("Please enter a query.")
 
 if __name__ == "__main__":
     main()
